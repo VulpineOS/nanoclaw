@@ -12,6 +12,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { registerProviderContainerConfig } from './provider-container-registry.js';
+import { getContainerConfig } from '../db/container-configs.js';
 
 function mergeNoProxy(current: string | undefined, additions: string): string {
   if (!current?.trim()) return additions;
@@ -37,9 +38,20 @@ registerProviderContainerConfig('opencode', (ctx) => {
     NO_PROXY: mergeNoProxy(ctx.hostEnv.NO_PROXY, '127.0.0.1,localhost'),
     no_proxy: mergeNoProxy(ctx.hostEnv.no_proxy, '127.0.0.1,localhost'),
   };
-  for (const key of ['OPENCODE_PROVIDER', 'OPENCODE_MODEL', 'OPENCODE_SMALL_MODEL'] as const) {
-    const value = ctx.hostEnv[key];
-    if (value) env[key] = value;
+
+  const containerConfig = getContainerConfig(ctx.agentGroupId);
+  if (containerConfig) {
+    if (containerConfig.provider) {
+      env['OPENCODE_PROVIDER'] = containerConfig.provider;
+    }
+    if (containerConfig.model) {
+      env['OPENCODE_MODEL'] = containerConfig.model;
+    }
+  } else {
+    for (const key of ['OPENCODE_PROVIDER', 'OPENCODE_MODEL', 'OPENCODE_SMALL_MODEL'] as const) {
+      const value = ctx.hostEnv[key];
+      if (value) env[key] = value;
+    }
   }
 
   return {
