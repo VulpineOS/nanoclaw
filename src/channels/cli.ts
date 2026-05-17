@@ -26,8 +26,9 @@
  *
  * Single-client chat semantics: one connected terminal at a time. A second
  * "chat" connection closes the first with a "superseded" notice. Admin
- * route-opcode connections (`to` set) are one-shot and do NOT evict an
- * active chat client.
+ * route-opcode connections (`to` set) do NOT evict an active chat client;
+ * when they target a CLI reply address, the socket is held as that routed
+ * platform's reply client until it closes.
  *
  * deliver() silently no-ops when no client is connected. The outbound row
  * is already in outbound.db, so the message isn't lost — it just doesn't
@@ -48,9 +49,14 @@ function socketPath(): string {
   return path.join(DATA_DIR, 'cli.sock');
 }
 
+export function createCliAdapterForTest(): ChannelAdapter {
+  return createAdapter();
+}
+
 function createAdapter(): ChannelAdapter {
   let server: net.Server | null = null;
   let client: net.Socket | null = null;
+  const routedClients = new Map<string, net.Socket>();
 
   const adapter: ChannelAdapter = {
     name: 'cli',
@@ -117,8 +123,8 @@ function createAdapter(): ChannelAdapter {
     },
 
     async deliver(platformId, _threadId, message: OutboundMessage): Promise<string | undefined> {
-      if (platformId !== PLATFORM_ID) return undefined;
-      if (!client) {
+      const target = platformId === PLATFORM_ID ? client : routedClients.get(platformId);
+      if (!target) {
         // No live terminal — outbound row is already persisted, so this
         // isn't a data loss. User will see it on the next connect cycle
         // (or never, if we don't add scroll-back). Not worth throwing.
@@ -127,7 +133,7 @@ function createAdapter(): ChannelAdapter {
       const text = extractText(message);
       if (text === null) return undefined;
       try {
-        client.write(JSON.stringify({ text }) + '\n');
+        target.write(JSON.stringify({ text }) + '\n');
       } catch (err) {
         log.warn('Failed to write to CLI client', { err });
       }
@@ -140,6 +146,7 @@ function createAdapter(): ChannelAdapter {
     // to be a routed (`to`-bearing) one-shot, we leave the existing chat
     // client in place. Only plain chat connections participate in supersede.
     let claimedChatSlot = false;
+    let routedPlatformId: string | null = null;
 
     const claimChatSlot = () => {
       if (claimedChatSlot) return;
@@ -156,6 +163,21 @@ function createAdapter(): ChannelAdapter {
       log.info('CLI client connected');
     };
 
+    const registerRoutedClient = (platformId: string) => {
+      const existing = routedClients.get(platformId);
+      if (existing && existing !== socket) {
+        try {
+          existing.write(JSON.stringify({ text: '[superseded by a newer client]' }) + '\n');
+          existing.end();
+        } catch {
+          // swallow
+        }
+      }
+      routedClients.set(platformId, socket);
+      routedPlatformId = platformId;
+      log.info('CLI routed client connected', { platformId });
+    };
+
     let buffer = '';
     socket.on('data', (chunk) => {
       buffer += chunk.toString('utf8');
@@ -164,12 +186,15 @@ function createAdapter(): ChannelAdapter {
         const line = buffer.slice(0, idx).trim();
         buffer = buffer.slice(idx + 1);
         if (!line) continue;
-        void handleLine(line, config, claimChatSlot);
+        void handleLine(line, config, claimChatSlot, registerRoutedClient);
       }
     });
 
     socket.on('close', () => {
       if (client === socket) client = null;
+      if (routedPlatformId && routedClients.get(routedPlatformId) === socket) {
+        routedClients.delete(routedPlatformId);
+      }
       if (claimedChatSlot) log.info('CLI client disconnected');
     });
 
@@ -178,7 +203,12 @@ function createAdapter(): ChannelAdapter {
     });
   }
 
-  async function handleLine(line: string, config: ChannelSetup, claimChatSlot: () => void): Promise<void> {
+  async function handleLine(
+    line: string,
+    config: ChannelSetup,
+    claimChatSlot: () => void,
+    registerRoutedClient: (platformId: string) => void,
+  ): Promise<void> {
     let payload: {
       text?: unknown;
       to?: unknown;
@@ -218,6 +248,8 @@ function createAdapter(): ChannelAdapter {
         replyTo: replyTo ?? undefined,
       };
       try {
+        const replyPlatformId = replyTo?.channelType === adapter.channelType ? replyTo.platformId : to.platformId;
+        registerRoutedClient(replyPlatformId);
         await config.onInboundEvent(event);
       } catch (err) {
         log.error('CLI: onInboundEvent threw', { err });
