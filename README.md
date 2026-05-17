@@ -17,6 +17,21 @@
 
 ---
 
+## VulpineOS Fork
+
+This repository is the VulpineOS-maintained NanoClaw fork used by fresh VulpineOS installs. It tracks upstream NanoClaw, but includes integration patches required for VulpineOS agent routing.
+
+Key differences from standard NanoClaw:
+
+- CLI socket replies can be delivered to routed CLI platform IDs such as `cli/vulpine:<agentID>`.
+- Routed CLI socket clients are kept per platform ID, so VulpineOS can run separate Vulpine agents against separate NanoClaw sessions without stealing the normal `cli/local` chat client.
+- The CLI route behavior is covered by `src/channels/cli.test.ts`.
+- VulpineOS can use one NanoClaw agent group while creating one NanoClaw messaging group/session per Vulpine agent.
+
+Practical effect: VulpineOS agents do not share a single `cli/local` NanoClaw chat session. Each Vulpine agent can route to `cli/vulpine:<agentID>`, get its own NanoClaw session/container lifecycle, and receive replies back on the correct socket connection.
+
+This fork may also carry VulpineOS-specific provider/runtime changes, including Codex provider integration and local container/runtime adjustments needed by the VulpineOS installer.
+
 ## Why I Built NanoClaw
 
 [OpenClaw](https://github.com/openclaw/openclaw) is an impressive project, but I wouldn't have been able to sleep if I had given complex software I didn't understand full access to my life. OpenClaw has nearly half a million lines of code, 53 config files, and 70+ dependencies. Its security is at the application level (allowlists, pairing codes) rather than true OS-level isolation. Everything runs in one Node process with shared memory.
