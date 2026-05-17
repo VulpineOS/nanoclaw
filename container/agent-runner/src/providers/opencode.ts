@@ -91,6 +91,7 @@ function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> 
 
   const providerModelId = model ? model.replace(new RegExp(`^${provider}/`), '') : undefined;
   const providerSmallModelId = smallModel ? smallModel.replace(new RegExp(`^${provider}/`), '') : undefined;
+  const supportsToolCalls = model !== 'openrouter/free';
   const modelsToRegister = [providerModelId, providerSmallModelId]
     .filter(Boolean)
     .filter((mid, i, a) => a.indexOf(mid as string) === i);
@@ -104,7 +105,7 @@ function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> 
             ...(modelsToRegister.length > 0
               ? {
                   models: Object.fromEntries(
-                    modelsToRegister.map((mid) => [mid, { id: mid, name: mid, tool_call: true }]),
+                    modelsToRegister.map((mid) => [mid, { id: mid, name: mid, tool_call: supportsToolCalls }]),
                   ),
                 }
               : {}),
@@ -128,6 +129,7 @@ function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> 
     ...(smallModel ? { small_model: smallModel } : {}),
     enabled_providers: [provider],
     permission: 'allow',
+    ...(model === 'openrouter/free' ? { tools: { bash: false } } : {}),
     autoupdate: false,
     snapshot: false,
     provider: providerOptions,

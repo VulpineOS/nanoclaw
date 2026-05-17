@@ -22,6 +22,7 @@ ARG INSTALL_CJK_FONTS=false
 ARG CLAUDE_CODE_VERSION=2.1.128
 ARG AGENT_BROWSER_VERSION=latest
 ARG VERCEL_VERSION=52.2.1
+ARG OPENCODE_VERSION=1.15.3
 ARG BUN_VERSION=1.3.12
 
 # ---- System dependencies -----------------------------------------------------
@@ -102,10 +103,14 @@ RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     echo "only-built-dependencies[]=agent-browser" > /root/.npmrc && \
     echo "only-built-dependencies[]=@anthropic-ai/claude-code" >> /root/.npmrc && \
+    echo "only-built-dependencies[]=opencode-ai" >> /root/.npmrc && \
     pnpm install -g "vercel@${VERCEL_VERSION}"
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "agent-browser@${AGENT_BROWSER_VERSION}"
+
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    pnpm install -g "opencode-ai@${OPENCODE_VERSION}"
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"

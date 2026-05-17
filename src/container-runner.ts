@@ -48,6 +48,7 @@ import {
 import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
+const ONECLI_CA_DESTINATIONS = ['/tmp/onecli-gateway-ca.pem', '/tmp/onecli-combined-ca.pem'];
 
 /** Active containers tracked by session ID. */
 const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
@@ -430,6 +431,7 @@ async function buildContainerArgs(
   if (!onecliApplied) {
     throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
   }
+  relocateOnecliCaMounts(args);
   log.info('OneCLI gateway applied', { containerName });
 
   // Host gateway
@@ -462,6 +464,29 @@ async function buildContainerArgs(
   args.push('-c', 'exec bun run /app/src/index.ts');
 
   return args;
+}
+
+function relocateOnecliCaMounts(args: string[]): void {
+  const caDir = path.join(DATA_DIR, 'onecli-ca');
+
+  for (let i = 0; i < args.length - 1; i++) {
+    if (args[i] !== '-v') continue;
+
+    const mountSpec = args[i + 1];
+    for (const destination of ONECLI_CA_DESTINATIONS) {
+      const marker = `:${destination}`;
+      const markerIndex = mountSpec.indexOf(marker);
+      if (markerIndex === -1) continue;
+
+      const source = mountSpec.slice(0, markerIndex);
+      if (!fs.existsSync(source) || !fs.statSync(source).isFile()) continue;
+
+      fs.mkdirSync(caDir, { recursive: true });
+      const relocated = path.join(caDir, path.basename(source));
+      fs.copyFileSync(source, relocated);
+      args[i + 1] = `${relocated}${mountSpec.slice(markerIndex)}`;
+    }
+  }
 }
 
 /** Build a per-agent-group Docker image with custom packages. */

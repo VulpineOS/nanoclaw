@@ -177,6 +177,22 @@ export function writeSessionRouting(agentGroupId: string, sessionId: string): vo
       platform_id: platformId,
       thread_id: session.thread_id,
     });
+    if (channelType && platformId) {
+      db.prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('reply', @display_name, 'channel', @channel_type, @platform_id, NULL)
+         ON CONFLICT(name) DO UPDATE SET
+           display_name = excluded.display_name,
+           type = excluded.type,
+           channel_type = excluded.channel_type,
+           platform_id = excluded.platform_id,
+           agent_group_id = excluded.agent_group_id`,
+      ).run({
+        display_name: platformId,
+        channel_type: channelType,
+        platform_id: platformId,
+      });
+    }
   } finally {
     db.close();
   }

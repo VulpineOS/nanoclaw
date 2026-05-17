@@ -41,7 +41,9 @@ registerProviderContainerConfig('opencode', (ctx) => {
 
   const containerConfig = getContainerConfig(ctx.agentGroupId);
   if (containerConfig) {
-    if (containerConfig.provider) {
+    if (containerConfig.model?.includes('/')) {
+      env['OPENCODE_PROVIDER'] = containerConfig.model.split('/')[0];
+    } else if (containerConfig.provider && containerConfig.provider !== 'opencode') {
       env['OPENCODE_PROVIDER'] = containerConfig.provider;
     }
     if (containerConfig.model) {
