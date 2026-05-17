@@ -4,3 +4,6 @@
 
 import './claude.js';
 import './mock.js';
+import './codex.js';
+import './opencode.js';
+import './mcp-to-opencode.js';
