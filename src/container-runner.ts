@@ -396,6 +396,18 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
   }
 }
 
+function readVulpineAgentBrowserCDP(folder: string): string | undefined {
+  try {
+    const raw = fs.readFileSync(path.join(GROUPS_DIR, folder, 'agent-browser.json'), 'utf8');
+    const cfg = JSON.parse(raw) as { cdp?: unknown; cdpUrl?: unknown };
+    const value = typeof cfg.cdp === 'string' ? cfg.cdp : typeof cfg.cdpUrl === 'string' ? cfg.cdpUrl : '';
+    const trimmed = value.trim();
+    return trimmed || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
@@ -410,6 +422,12 @@ async function buildContainerArgs(
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  const agentBrowserCDP = readVulpineAgentBrowserCDP(agentGroup.folder);
+  if (agentBrowserCDP) {
+    args.push('-e', `AGENT_BROWSER_CDP=${agentBrowserCDP}`);
+    args.push('-e', `AGENT_BROWSER_CDP_URL=${agentBrowserCDP}`);
+  }
 
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {

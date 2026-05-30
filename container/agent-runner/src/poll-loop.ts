@@ -421,6 +421,21 @@ async function processQuery(
   try {
     for await (const event of query.events) {
       handleEvent(event, routing);
+
+      // Non-retryable provider errors (bad request, misconfiguration, etc.)
+      // must be surfaced to the user. Write an outbound error message so the
+      // session mirror picks it up and the TUI clears its thinking state.
+      if (event.type === 'error' && !event.retryable) {
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: `Provider error: ${event.message}` }),
+        });
+      }
+
       touchHeartbeat();
 
       if (event.type === 'init') {
@@ -509,6 +524,10 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
 
     const dest = findByName(toName);
     if (!dest) {
+      if (isVulpineReplyAlias(toName) && sendToCurrentRouting(body, routing)) {
+        sent++;
+        continue;
+      }
       log(`Unknown destination in <message to="${toName}">, dropping block`);
       scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
       continue;
@@ -526,11 +545,34 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
     log(`[scratchpad] ${scratchpad.slice(0, 500)}${scratchpad.length > 500 ? '…' : ''}`);
   }
 
-  const hasUnwrapped = sent === 0 && !!scratchpad;
+  let hasUnwrapped = sent === 0 && !!scratchpad;
+  if (hasUnwrapped && sendToCurrentRouting(scratchpad, routing)) {
+    sent++;
+    hasUnwrapped = false;
+  }
   if (hasUnwrapped) {
     log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
   }
   return { sent, hasUnwrapped };
+}
+
+function isVulpineReplyAlias(name: string): boolean {
+  const normalized = name.trim().toLowerCase();
+  return normalized === 'vulpine' || normalized === 'vulpineos' || normalized === 'user' || normalized === 'operator';
+}
+
+function sendToCurrentRouting(body: string, routing: RoutingContext): boolean {
+  if (!routing.channelType || !routing.platformId) return false;
+  writeMessageOut({
+    id: generateId(),
+    in_reply_to: routing.inReplyTo,
+    kind: 'chat',
+    platform_id: routing.platformId,
+    channel_type: routing.channelType,
+    thread_id: routing.threadId,
+    content: JSON.stringify({ text: body }),
+  });
+  return true;
 }
 
 function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {
