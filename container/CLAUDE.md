@@ -58,7 +58,7 @@ Do not attack any task — whether research, debugging, investigation, feature w
 1. **Decompose** — break the task into independent facets. For research this might be: professional presence, code repositories, news/articles. For debugging: possible causes, environment factors, recent changes. For any complex question: different interpretations, perspectives, and sources of evidence.
 2. **Generate multiple approaches** — produce specific, distinct lines of inquiry, one per facet. Each should explore something different, not the same thing rephrased.
 3. **Execute** — tackle each facet, either sequentially (working alone) or in parallel (with sub-agents).
-4. **Document** — record findings for each facet as you go so you don't revisit the same ground.
+4. **Document as you go** — maintain a research log in `/workspace/agent/research-log.md` (or a task-specific name). Record every URL visited, every search query run, and what each produced. This is not optional — you will be asked "what did you do?" and need to be able to answer without relying on ephemeral tool call history. Each entry should include: timestamp, what you did (URL visited / search query / action taken), and a brief summary of the result.
 5. **Synthesize** — combine findings, identify gaps, contradictions, or convergence. Decide if a follow-up round is needed.
 
 ### Working Alone (Single-Agent)
@@ -69,7 +69,7 @@ When working alone, still be systematic:
 - Vary your approach — use different queries, tools, and entry points
 - Use browser automation (`agent-browser` via `bash`) to reach what search alone can't — profile pages, directories, interactive interfaces
 - When you encounter barriers (consent walls, paywalls, login prompts), handle them interactively rather than treating them as dead ends — click through, fill forms, navigate the interface
-- Keep a running document of what you've found and what you still need
+- Keep a running research log (`/workspace/agent/research-log.md`) of every URL, search query, and action taken — you will be asked to recount what you did
 
 ### Parallel Work (Multi-Agent)
 
@@ -78,9 +78,9 @@ For thorough coverage of any non-trivial task, use sub-agents to explore differe
 1. **Decompose** the request into 3-5 independent angles
 2. **Spawn sub-agents** via `create_agent <name> <instruction>`, each with:
    - A specific facet to explore (not a vague "help me", but a concrete mission)
-   - A clear output format for their findings
-3. **Run in parallel** — each sub-agent works independently, using its own tools
-4. **Collect results** — each sub-agent writes findings to its workspace and reports back
+   - A clear output format for their findings (including a log of every URL/query/action they took)
+3. **Run in parallel** — each sub-agent works independently, using its own tools, and maintains its own research log
+4. **Collect results** — each sub-agent writes findings and its full action log to its workspace and reports back
 5. **Synthesize** — combine findings, note contradictions or gaps, and decide if a second round is needed
 
 Example decomposition of "find everything about a person":
