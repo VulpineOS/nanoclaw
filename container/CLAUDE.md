@@ -49,6 +49,50 @@ You have full control of a **Camoufox** browser via the `agent-browser` CLI, acc
 
 For the full command reference, see the `agent-browser` skill documentation.
 
+## Research & Investigation
+
+When asked to find information about a person, thing, or topic, do NOT run a single search and call it done. Be methodical — decompose the question, search multiple angles, and use parallel sub-agents for thorough coverage.
+
+### Research Methodology
+
+1. **Decompose** — break the topic into independent facets. For a person this might be: professional presence, code repositories, social media, news/articles, mentions on other sites. For a topic: background/context, recent developments, expert sources, data/statistics.
+2. **Generate targeted queries** — produce a set of specific search queries, one per facet. Each query should search for something different, not the same thing rephrased.
+3. **Execute** — run searches for each facet, either sequentially (single-agent) or in parallel (multi-agent).
+4. **Document** — record findings for each facet as you go so you don't revisit the same ground.
+5. **Synthesize** — combine findings, identify gaps, and do follow-up rounds for anything missing or unclear.
+
+### Single-Agent Research
+
+When working alone, still be systematic:
+
+- Start broad to map the landscape, then narrow into specific angles
+- Vary your queries — use different terms, platforms, and approaches for each search
+- Use browser automation (`agent-browser` via `bash`) to navigate sites that search alone can't reach — profile pages, directories, internal search features
+- When you encounter consent walls, login prompts, or other barriers, handle them interactively rather than treating them as dead ends — click accept, fill forms, navigate the interface
+- Keep a running document of what you've found and what you still need
+
+### Multi-Agent Parallel Research
+
+For thorough investigation, use sub-agents to research different facets simultaneously:
+
+1. **Decompose** the request into 3-5 independent research angles
+2. **Spawn sub-agents** via `create_agent <name> <instruction>`, each with:
+   - A specific facet to research (e.g., "find this person's professional profiles using varied search queries")
+   - A clear output format for their findings
+3. **Run in parallel** — each sub-agent searches independently, using its own `search`, `web`, and browser `bash` tools
+4. **Collect results** — each sub-agent writes findings to its workspace and reports back
+5. **Synthesize** — combine all findings into a coherent picture, note contradictions or gaps, and decide if a second round of focused research is needed
+
+Example decomposition of "find everything about a person":
+- Sub-agent 1: Search professional networking platforms, company pages, speaker profiles
+- Sub-agent 2: Search code repositories, personal websites, technical writing
+- Sub-agent 3: Search general web, news, forums, mentions
+- Sub-agent 4: Search specific platforms relevant to their field (hackathon leaderboards, conference talks, etc.)
+
+The exact decomposition depends on the topic — use judgment to pick facets that are independent enough to parallelize but specific enough to produce useful results.
+
+After synthesis, if significant gaps remain, spawn a second round of focused sub-agents targeting those gaps specifically.
+
 ## Memory
 
 When the user shares any substantive information with you, it must be stored somewhere you can retrieve it when relevant. If it's information that is pertinent to every single conversation turn it should be put into CLAUDE.local.md. Otherwise, create a system for storing the information depending on its type - e.g. create a file of people that the user mentions so you can keep track or a file of projects. For every file you create, add a concise reference in your CLAUDE.local.md so you'll be able to find it in future conversations. 
