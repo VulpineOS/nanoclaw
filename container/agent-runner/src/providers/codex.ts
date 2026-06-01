@@ -1,4 +1,5 @@
 import { execSync } from 'child_process';
+import * as fs from 'fs';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
@@ -242,6 +243,32 @@ class CodexProvider implements AgentProvider {
         }
 
         // SSE stream — Responses API format
+        const streamPath = process.env.STREAM_PATH || '/workspace/stream.jsonl';
+        let streamFd: number | null = null;
+        try { streamFd = fs.openSync(streamPath, 'w'); } catch (_) {}
+
+        process.on('exit', () => {
+          try { fs.unlinkSync(streamPath); } catch (_) {}
+        });
+
+        const MAX_STREAM_FILE_SIZE = 256 * 1024;
+        let streamFileSize = 0;
+        const streamByteLength = (s: string): number => new TextEncoder().encode(s).length;
+        function streamWriteSync(data: string) {
+          if (streamFd === null) return;
+          const line = data + '\n';
+          if (streamFileSize + streamByteLength(line) > MAX_STREAM_FILE_SIZE) {
+            try { fs.ftruncateSync(streamFd, 0); fs.closeSync(streamFd); } catch (_) {}
+            streamFd = null;
+            return;
+          }
+          try {
+            fs.writeSync(streamFd, line);
+            fs.fsyncSync(streamFd);
+            streamFileSize += streamByteLength(line);
+          } catch (_) {}
+        }
+
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
@@ -287,6 +314,7 @@ class CodexProvider implements AgentProvider {
               if (type === 'response.output_text.delta') {
                 const delta = parsed.delta as string || '';
                 content += delta;
+                streamWriteSync(JSON.stringify({ t: delta }));
                 yield { type: 'activity' };
               } else if (type === 'response.function_call_arguments.delta') {
                 const delta = parsed.delta as string || '';
@@ -314,6 +342,12 @@ class CodexProvider implements AgentProvider {
           }
         }
 
+        // Write done marker after SSE stream ends
+        if (content) {
+          streamWriteSync(JSON.stringify({ done: content }));
+        }
+        if (streamFd !== null) { try { fs.closeSync(streamFd); } catch (_) {} }
+
         // Process results
         if (hasToolCall && toolName) {
           history.push({ role: 'assistant', text: content || '' });
@@ -325,22 +359,27 @@ class CodexProvider implements AgentProvider {
             const args = JSON.parse(toolArgs || '{}') as Record<string, unknown>;
             if (toolName === 'bash') {
               const command = String(args.command ?? '');
-              const timeout = typeof args.timeout === 'number' ? args.timeout : 30000;
-              result = execSync(command, {
-                cwd: '/workspace/agent',
-                timeout,
-                encoding: 'utf-8',
-                maxBuffer: 50 * 1024 * 1024,
-                signal: controller.signal,
-              });
-              if (result.length > 50000) {
-                result = result.slice(0, 50000) + `\n... [truncated ${result.length - 50000} more bytes]`;
+              const FORBIDDEN = /\b(playwright|puppeteer|selenium)\b/i;
+              if (FORBIDDEN.test(command)) {
+                result = 'Error: This command contains a reference to a forbidden browser automation tool (Playwright, Puppeteer, or Selenium). These tools are NOT available in this container. Use agent-browser for all browser interaction.';
+              } else {
+                const timeout = typeof args.timeout === 'number' ? args.timeout : 30000;
+                result = execSync(command, {
+                  cwd: '/workspace/agent',
+                  timeout,
+                  encoding: 'utf-8',
+                  maxBuffer: 50 * 1024 * 1024,
+                  signal: controller.signal,
+                });
+                if (result.length > 50000) {
+                  result = result.slice(0, 50000) + `\n... [truncated ${result.length - 50000} more bytes]`;
+                }
               }
             } else if (toolName === 'web') {
               const url = String(args.url ?? '');
               try {
                 const cdpUrl = process.env.AGENT_BROWSER_CDP || process.env.AGENT_BROWSER_CDP_URL;
-                const cmd = 'agent-browser connect ' + cdpUrl + ' && agent-browser open ' + JSON.stringify(url) + ' && agent-browser wait --load networkidle && agent-browser snapshot -i';
+                const cmd = 'agent-browser connect ' + cdpUrl + ' && agent-browser open ' + JSON.stringify(url) + ' && agent-browser wait --load networkidle && agent-browser snapshot -c';
                 result = execSync(cmd, {
                   cwd: '/workspace/agent',
                   timeout: 60000,
@@ -360,7 +399,7 @@ class CodexProvider implements AgentProvider {
               try {
                 const cdpUrl = process.env.AGENT_BROWSER_CDP || process.env.AGENT_BROWSER_CDP_URL;
                 const searchUrl = 'https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(query);
-                const cmd = 'agent-browser connect ' + cdpUrl + ' && agent-browser open ' + JSON.stringify(searchUrl) + ' && agent-browser wait --load networkidle && agent-browser snapshot -i';
+                const cmd = 'agent-browser connect ' + cdpUrl + ' && agent-browser open ' + JSON.stringify(searchUrl) + ' && agent-browser wait --load networkidle && agent-browser snapshot -c';
                 result = execSync(cmd, {
                   cwd: '/workspace/agent',
                   timeout: 60000,

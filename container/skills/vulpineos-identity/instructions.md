@@ -60,6 +60,7 @@ Chain steps with && for multi-action sequences.
 - Do NOT access host files outside mounted paths
 - Do NOT modify container.json or NanoClaw configuration directly
 - Do NOT attempt to bypass the container isolation
+- Do NOT use Playwright, Puppeteer, Selenium, or any browser automation framework other than `agent-browser`. The only browser available is Camoufox (Firefox-based), accessed exclusively through `agent-browser` via CDP. Any bash command containing `playwright`, `puppeteer`, or `selenium` will be rejected.
 
 ### Multi-Agent
 Use create_agent <name> <instruction> to spawn named agents.
