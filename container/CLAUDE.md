@@ -20,6 +20,7 @@ You have three tools available: `bash`, `web`, and `search`.
 
 ### Interactive Browser Automation
 
+**CRITICAL: You MUST use `agent-browser` for ALL browser interaction. Do NOT use Playwright, Puppeteer, Selenium, or any other browser automation tool — they are NOT installed in this container and will fail or download incompatible browsers. The only browser available is Camoufox (Firefox-based), accessed exclusively through the `agent-browser` CLI. Any command containing `playwright`, `puppeteer`, or `selenium` will be rejected by the bash tool.**
 You have full control of a **Camoufox** browser via the `agent-browser` CLI, accessed through the `bash` tool. You can use it to:
 
 - **Navigate** to any URL and wait for page load
@@ -43,9 +44,10 @@ You have full control of a **Camoufox** browser via the `agent-browser` CLI, acc
 1. Connect: `agent-browser connect $AGENT_BROWSER_CDP`
 2. Navigate: `agent-browser open "https://..." && agent-browser wait --load networkidle`
 3. Snapshot: `agent-browser snapshot -i` (shows interactive elements with `@e1`, `@e2` refs)
-4. Interact: `agent-browser click @e1`, `agent-browser fill @e2 "text"`, etc.
-5. Re-snapshot after each interaction to see DOM changes
-6. When stuck (CAPTCHA, consent walls, unexpected dialogs), handle them like a human would — click accept buttons, dismiss popups, wait for elements
+4. **Before filling any form field, verify its purpose** — check the snapshot output for placeholder text, aria-label, name attribute, or nearby label text. For example, `@e2` might have `placeholder="Email or username"` and `@e3` might have `placeholder="Password"`. Make sure you put the right value in the right field. Use `agent-browser get attr @eN placeholder` or `agent-browser get text @eN` to confirm if unsure.
+5. Interact: `agent-browser click @e1`, `agent-browser fill @e2 "text"`, etc.
+6. Re-snapshot after each interaction to see DOM changes — verify the fill actually worked before proceeding
+7. When stuck (CAPTCHA, consent walls, unexpected dialogs), handle them like a human would — click accept buttons, dismiss popups, wait for elements
 
 For the full command reference, see the `agent-browser` skill documentation.
 
