@@ -1,4 +1,5 @@
 import { execSync } from 'child_process';
+import * as fs from 'fs';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
@@ -126,31 +127,22 @@ class CodexProvider implements AgentProvider {
       return;
     }
 
-    // Build history from input context
-    type HistoryEntry =
-      | { role: 'assistant'; text: string }
-      | { role: 'function_call'; call_id: string; name: string; arguments: string }
-      | { role: 'tool'; call_id: string; text: string };
-    const history: HistoryEntry[] = [];
-    const contextLines = (input.systemContext?.contextText || '').split('\n').filter(Boolean);
-    for (const line of contextLines) {
-      const colon = line.indexOf(':');
-      if (colon > 0) {
-        const key = line.slice(0, colon);
-        const val = line.slice(colon + 1);
-        if (key === 'assistant') history.push({ role: 'assistant', text: val });
-        else if (key === 'tool') {
-          const pipe = val.indexOf('|');
-          if (pipe > 0) {
-            history.push({ role: 'tool', call_id: val.slice(0, pipe), text: val.slice(pipe + 1) });
-          }
-        }
-      }
-    }
-
     const instructions = input.systemContext?.instructions || 'You are a helpful assistant.';
 
     yield { type: 'init', continuation: `codex-${Date.now()}` };
+
+    // Build conversation state before the loop (opencode/openrouter pattern):
+    // input.prompt is added ONCE as the initial user message. After tool calls,
+    // the assistant response and tool results are appended to this same array
+    // so the API always receives the full history without re-adding the prompt.
+    type MsgEntry =
+      | { role: 'user'; content: string }
+      | { role: 'assistant'; content: string }
+      | { role: 'function_call'; call_id: string; name: string; arguments: string }
+      | { role: 'function_call_output'; call_id: string; output: string };
+    const conversation: MsgEntry[] = [
+      { role: 'user', content: input.prompt },
+    ];
 
     while (true) {
       yield { type: 'activity' };
@@ -162,15 +154,21 @@ class CodexProvider implements AgentProvider {
         return;
       }
 
-      // Build Responses API input array from history + current message + followups
+      // Build Responses API input array from conversation + followups
       const responseInput: ResponsesInputItem[] = [];
 
-      for (const entry of history) {
-        if (entry.role === 'assistant') {
+      for (const entry of conversation) {
+        if (entry.role === 'user') {
+          responseInput.push({
+            type: 'message',
+            role: 'user',
+            content: entry.content,
+          });
+        } else if (entry.role === 'assistant') {
           responseInput.push({
             type: 'message',
             role: 'assistant',
-            content: entry.text,
+            content: entry.content,
             status: 'completed',
           });
         } else if (entry.role === 'function_call') {
@@ -180,28 +178,23 @@ class CodexProvider implements AgentProvider {
             name: entry.name,
             arguments: entry.arguments,
           });
-        } else if (entry.role === 'tool') {
+        } else if (entry.role === 'function_call_output') {
           responseInput.push({
             type: 'function_call_output',
             call_id: entry.call_id,
-            output: entry.text,
+            output: entry.output,
           });
         }
       }
 
-      // Current user message + any followups
-      responseInput.push({
-        type: 'message',
-        role: 'user',
-        content: input.prompt,
-      });
-
+      // Follow-up messages (from poll-loop while query is active)
       for (const msg of followups.drain()) {
         responseInput.push({
           type: 'message',
           role: 'user',
           content: msg,
         });
+        conversation.push({ role: 'user', content: msg });
       }
 
       try {
@@ -242,6 +235,32 @@ class CodexProvider implements AgentProvider {
         }
 
         // SSE stream — Responses API format
+        const streamPath = process.env.STREAM_PATH || '/workspace/stream.jsonl';
+        let streamFd: number | null = null;
+        try { streamFd = fs.openSync(streamPath, 'w'); } catch (_) {}
+
+        process.on('exit', () => {
+          try { fs.unlinkSync(streamPath); } catch (_) {}
+        });
+
+        const MAX_STREAM_FILE_SIZE = 256 * 1024;
+        let streamFileSize = 0;
+        const streamByteLength = (s: string): number => new TextEncoder().encode(s).length;
+        function streamWriteSync(data: string) {
+          if (streamFd === null) return;
+          const line = data + '\n';
+          if (streamFileSize + streamByteLength(line) > MAX_STREAM_FILE_SIZE) {
+            try { fs.ftruncateSync(streamFd, 0); fs.closeSync(streamFd); } catch (_) {}
+            streamFd = null;
+            return;
+          }
+          try {
+            fs.writeSync(streamFd, line);
+            fs.fsyncSync(streamFd);
+            streamFileSize += streamByteLength(line);
+          } catch (_) {}
+        }
+
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
@@ -287,6 +306,7 @@ class CodexProvider implements AgentProvider {
               if (type === 'response.output_text.delta') {
                 const delta = parsed.delta as string || '';
                 content += delta;
+                streamWriteSync(JSON.stringify({ t: delta }));
                 yield { type: 'activity' };
               } else if (type === 'response.function_call_arguments.delta') {
                 const delta = parsed.delta as string || '';
@@ -314,33 +334,44 @@ class CodexProvider implements AgentProvider {
           }
         }
 
+        // Write done marker after SSE stream ends
+        if (content) {
+          streamWriteSync(JSON.stringify({ done: content }));
+        }
+        if (streamFd !== null) { try { fs.closeSync(streamFd); } catch (_) {} }
+
         // Process results
         if (hasToolCall && toolName) {
-          history.push({ role: 'assistant', text: content || '' });
+          conversation.push({ role: 'assistant', content: content || '' });
 
           const tcCallId = toolCallId || `call_${Date.now()}`;
-          history.push({ role: 'function_call', call_id: tcCallId, name: toolName, arguments: toolArgs });
+          conversation.push({ role: 'function_call', call_id: tcCallId, name: toolName, arguments: toolArgs });
           let result: string;
           try {
             const args = JSON.parse(toolArgs || '{}') as Record<string, unknown>;
             if (toolName === 'bash') {
               const command = String(args.command ?? '');
-              const timeout = typeof args.timeout === 'number' ? args.timeout : 30000;
-              result = execSync(command, {
-                cwd: '/workspace/agent',
-                timeout,
-                encoding: 'utf-8',
-                maxBuffer: 50 * 1024 * 1024,
-                signal: controller.signal,
-              });
-              if (result.length > 50000) {
-                result = result.slice(0, 50000) + `\n... [truncated ${result.length - 50000} more bytes]`;
+              const FORBIDDEN = /\b(playwright|puppeteer|selenium)\b/i;
+              if (FORBIDDEN.test(command)) {
+                result = 'Error: This command contains a reference to a forbidden browser automation tool (Playwright, Puppeteer, or Selenium). These tools are NOT available in this container. Use agent-browser for all browser interaction.';
+              } else {
+                const timeout = typeof args.timeout === 'number' ? args.timeout : 30000;
+                result = execSync(command, {
+                  cwd: '/workspace/agent',
+                  timeout,
+                  encoding: 'utf-8',
+                  maxBuffer: 50 * 1024 * 1024,
+                  signal: controller.signal,
+                });
+                if (result.length > 50000) {
+                  result = result.slice(0, 50000) + `\n... [truncated ${result.length - 50000} more bytes]`;
+                }
               }
             } else if (toolName === 'web') {
               const url = String(args.url ?? '');
               try {
                 const cdpUrl = process.env.AGENT_BROWSER_CDP || process.env.AGENT_BROWSER_CDP_URL;
-                const cmd = 'agent-browser connect ' + cdpUrl + ' && agent-browser open ' + JSON.stringify(url) + ' && agent-browser wait --load networkidle && agent-browser snapshot -i';
+                const cmd = 'agent-browser connect ' + cdpUrl + ' && agent-browser open ' + JSON.stringify(url) + ' && agent-browser wait --load networkidle && agent-browser snapshot -c';
                 result = execSync(cmd, {
                   cwd: '/workspace/agent',
                   timeout: 60000,
@@ -360,7 +391,7 @@ class CodexProvider implements AgentProvider {
               try {
                 const cdpUrl = process.env.AGENT_BROWSER_CDP || process.env.AGENT_BROWSER_CDP_URL;
                 const searchUrl = 'https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(query);
-                const cmd = 'agent-browser connect ' + cdpUrl + ' && agent-browser open ' + JSON.stringify(searchUrl) + ' && agent-browser wait --load networkidle && agent-browser snapshot -i';
+                const cmd = 'agent-browser connect ' + cdpUrl + ' && agent-browser open ' + JSON.stringify(searchUrl) + ' && agent-browser wait --load networkidle && agent-browser snapshot -c';
                 result = execSync(cmd, {
                   cwd: '/workspace/agent',
                   timeout: 60000,
@@ -382,7 +413,7 @@ class CodexProvider implements AgentProvider {
             result = `Error: ${err instanceof Error ? err.message : String(err)}`;
           }
 
-          history.push({ role: 'tool', call_id: tcCallId, text: result });
+          conversation.push({ role: 'function_call_output', call_id: tcCallId, output: result });
           yield { type: 'activity' };
           continue;
         }

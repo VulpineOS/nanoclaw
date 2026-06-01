@@ -1,425 +1,455 @@
-import { spawn, type ChildProcess } from 'child_process';
-
-import { createOpencodeClient, type OpencodeClient } from '@opencode-ai/sdk';
-
+import { execSync } from 'child_process';
+import * as fs from 'fs';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
-import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
 
-function log(msg: string): void {
-  console.error(`[opencode-provider] ${msg}`);
-}
-
-const SESSION_STATUS_RETRY_ERROR_AFTER = 3;
-
-/** Stale / dead OpenCode session heuristics (complement Claude-centric host patterns). */
-const STALE_SESSION_RE =
-  /no conversation found|ENOENT.*\.jsonl|session.*not found|NotFoundError|connection reset|ECONNRESET|404|event timeout/i;
-
-function killProcessTree(proc: ChildProcess): void {
-  if (!proc.pid) return;
-  try {
-    process.kill(-proc.pid, 'SIGKILL');
-  } catch {
-    try {
-      proc.kill('SIGKILL');
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-function spawnOpencodeServer(config: Record<string, unknown>, timeoutMs = 10_000): Promise<{ url: string; proc: ChildProcess }> {
-  return new Promise((resolve, reject) => {
-    const hostname = '127.0.0.1';
-    const port = 4096;
-    const proc = spawn('opencode', ['serve', `--hostname=${hostname}`, `--port=${port}`], {
-      env: {
-        ...process.env,
-        OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
-      },
-      detached: true,
-    });
-
-    const id = setTimeout(() => {
-      killProcessTree(proc);
-      reject(new Error(`Timeout waiting for OpenCode server to start after ${timeoutMs}ms`));
-    }, timeoutMs);
-
-    let output = '';
-    proc.stdout?.on('data', (chunk: Buffer) => {
-      output += chunk.toString();
-      for (const line of output.split('\n')) {
-        if (line.startsWith('opencode server listening')) {
-          const match = line.match(/on\s+(https?:\/\/[^\s]+)/);
-          if (match) {
-            clearTimeout(id);
-            resolve({ url: match[1], proc });
-          }
-        }
-      }
-    });
-    proc.stderr?.on('data', (chunk: Buffer) => {
-      output += chunk.toString();
-    });
-    proc.on('exit', (code) => {
-      clearTimeout(id);
-      let msg = `OpenCode server exited with code ${code}`;
-      if (output.trim()) msg += `\nServer output: ${output}`;
-      reject(new Error(msg));
-    });
-    proc.on('error', (err) => {
-      clearTimeout(id);
-      reject(err);
-    });
-  });
-}
-
-function wrapPromptWithContext(text: string, systemInstructions?: string): string {
-  let out = text;
-  if (systemInstructions) {
-    out = `<system>\n${systemInstructions}\n</system>\n\n${out}`;
-  }
-  return out;
-}
-
-function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> {
-  const provider = process.env.OPENCODE_PROVIDER || 'anthropic';
-  const model = process.env.OPENCODE_MODEL;
-  const smallModel = process.env.OPENCODE_SMALL_MODEL;
-  const proxyUrl = process.env.ANTHROPIC_BASE_URL;
-
-  const providerModelId = model ? model.replace(new RegExp(`^${provider}/`), '') : undefined;
-  const providerSmallModelId = smallModel ? smallModel.replace(new RegExp(`^${provider}/`), '') : undefined;
-  const supportsToolCalls = model !== 'openrouter/free';
-  const modelsToRegister = [providerModelId, providerSmallModelId]
-    .filter(Boolean)
-    .filter((mid, i, a) => a.indexOf(mid as string) === i);
-
-  const providerOptions: Record<string, unknown> =
-    provider === 'anthropic'
-      ? {}
-      : {
-          [provider]: {
-            options: { apiKey: 'placeholder', baseURL: proxyUrl },
-            ...(modelsToRegister.length > 0
-              ? {
-                  models: Object.fromEntries(
-                    modelsToRegister.map((mid) => [mid, { id: mid, name: mid, tool_call: supportsToolCalls }]),
-                  ),
-                }
-              : {}),
-          },
-        };
-
-  const mcp = mcpServersToOpenCodeConfig(options.mcpServers);
-
-  // Load shared base + per-group fragments + per-group memory through OpenCode's
-  // native instructions pipeline (session/instruction.ts). Absolute paths with
-  // globs are supported. Files are read raw — `@./...` includes are NOT expanded
-  // by OpenCode, so point at the concrete files, not at composed CLAUDE.md.
-  const instructions = [
-    '/app/CLAUDE.md',
-    '/workspace/agent/.claude-fragments/*.md',
-    '/workspace/agent/CLAUDE.local.md',
-  ];
-
-  return {
-    ...(model ? { model } : {}),
-    ...(smallModel ? { small_model: smallModel } : {}),
-    enabled_providers: [provider],
-    permission: 'allow',
-    ...(model === 'openrouter/free' ? { tools: { bash: false } } : {}),
-    autoupdate: false,
-    snapshot: false,
-    provider: providerOptions,
-    instructions,
-    mcp,
-  };
-}
-
-type SharedRuntime = {
-  proc: ChildProcess;
-  client: OpencodeClient;
-  stream: AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
-  streamRelease: () => void;
+type ChatMessage = {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string | null;
+  tool_calls?: Array<{
+    id: string;
+    type: 'function';
+    function: { name: string; arguments: string };
+  }>;
+  tool_call_id?: string;
 };
 
-let sharedRuntime: SharedRuntime | null = null;
-let sharedConfigKey: string | null = null;
-let sharedInit: Promise<SharedRuntime> | null = null;
+const DEFAULT_FALLBACK_MODELS = [
+  'openai/gpt-oss-20b:free',
+  'google/gemini-2.0-flash-exp:free',
+  'mistralai/mistral-nemo:free',
+];
 
-function runtimeConfigKey(options: ProviderOptions): string {
-  return JSON.stringify({
-    mcp: mcpServersToOpenCodeConfig(options.mcpServers),
-    model: process.env.OPENCODE_MODEL,
-    small: process.env.OPENCODE_SMALL_MODEL,
-    op: process.env.OPENCODE_PROVIDER,
-  });
-}
-
-async function ensureSharedRuntime(options: ProviderOptions): Promise<SharedRuntime> {
-  const key = runtimeConfigKey(options);
-  if (sharedRuntime && sharedConfigKey === key) return sharedRuntime;
-
-  if (sharedInit) return sharedInit;
-
-  sharedInit = (async () => {
-    if (sharedRuntime) {
-      destroySharedRuntime();
-    }
-    const config = buildOpenCodeConfig(options);
-    const { url, proc } = await spawnOpencodeServer(config);
-    const client = createOpencodeClient({ baseUrl: url });
-    const sub = await client.event.subscribe();
-    const stream = sub.stream as AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
-    sharedRuntime = {
-      proc,
-      client,
-      stream,
-      streamRelease: () => {
-        void stream.return?.(undefined);
+const WEB_TOOL = {
+  type: 'function' as const,
+  function: {
+    name: 'web',
+    description:
+      'Fetch a web page using the Camoufox browser via CDP. Uses agent-browser internally. This is the ONLY way to access the web \u2014 wget and curl are blocked by the network proxy.',
+    parameters: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'The URL to fetch' },
+        viewportOnly: { type: 'boolean', description: 'Only return elements visible in the current viewport (default: true). Saves tokens by omitting off-screen content. Disable for full-page analysis.' },
+        profile: { type: 'string', enum: ['compact', 'expanded', 'full'], description: 'Snapshot detail profile. compact: 180 nodes/90 chars per node (default). expanded: 360/160. full: 800/240.' },
+        maxNodes: { type: 'number', description: 'Maximum number of DOM nodes to return (overrides profile default). Lower values save tokens.' },
       },
-    };
-    sharedConfigKey = key;
-    sharedInit = null;
-    return sharedRuntime;
-  })();
+      required: ['url'],
+    },
+  },
+};
 
-  return sharedInit;
-}
+const BASH_TOOL = {
+  type: 'function' as const,
+  function: {
+    name: 'bash',
+    description:
+      'Execute a bash command in the workspace. For file operations, system commands, and running agent-browser for web scraping. Do NOT use wget or curl \u2014 they are blocked by the network proxy. For web access, use the web tool instead.',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'The bash command to execute' },
+        timeout: { type: 'number', description: 'Timeout in milliseconds (default: 30000)' },
+      },
+      required: ['command'],
+    },
+  },
+};
 
-export function destroySharedRuntime(): void {
-  if (sharedRuntime) {
-    try {
-      sharedRuntime.streamRelease();
-    } catch {
-      /* ignore */
-    }
-    killProcessTree(sharedRuntime.proc);
-    sharedRuntime = null;
-    sharedConfigKey = null;
+function fallbackModels(): string[] {
+  const env = process.env.OPENCODE_FALLBACK_MODELS;
+  if (env) {
+    return env.split(',').map(s => s.trim()).filter(Boolean);
   }
-  sharedInit = null;
+  return DEFAULT_FALLBACK_MODELS;
 }
 
-function sessionErrorMessage(props: { error?: unknown }): string {
-  const err = props.error as { data?: { message?: string } } | undefined;
-  if (err && typeof err === 'object' && err.data && typeof err.data.message === 'string') {
-    return err.data.message;
+function normalizeOpenRouterModel(model: string | undefined): string {
+  const value = model || process.env.OPENCODE_MODEL || 'openai/gpt-oss-20b:free';
+  return value.replace(/^openrouter\//, '');
+}
+
+function providerName(): string {
+  return process.env.OPENCODE_PROVIDER || 'openrouter';
+}
+
+function providerAPIKey(): string | undefined {
+  return process.env.OPENCODE_API_KEY || process.env.OPENROUTER_API_KEY;
+}
+
+class MessageStream {
+  private queue: string[] = [];
+  private _done = false;
+
+  push(text: string): void {
+    this.queue.push(text);
   }
-  return JSON.stringify(props.error) || 'OpenCode session error';
+
+  end(): void {
+    this._done = true;
+  }
+
+  drain(): string[] {
+    const items = this.queue;
+    this.queue = [];
+    return items;
+  }
+
+  get done(): boolean {
+    return this._done;
+  }
 }
 
-export class OpenCodeProvider implements AgentProvider {
+class OpenCodeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
 
-  private readonly options: ProviderOptions;
-  private activeSessionId: string | undefined;
+  constructor(private readonly options: ProviderOptions = {}) {}
 
-  constructor(options: ProviderOptions = {}) {
-    this.options = options;
-  }
-
-  isSessionInvalid(err: unknown): boolean {
-    const msg = err instanceof Error ? err.message : String(err);
-    return STALE_SESSION_RE.test(msg);
+  isSessionInvalid(): boolean {
+    return false;
   }
 
   query(input: QueryInput): AgentQuery {
-    if (input.continuation) {
-      this.activeSessionId = input.continuation;
-    } else {
-      this.activeSessionId = undefined;
+    const controller = new AbortController();
+    const stream = new MessageStream();
+    return {
+      push: msg => stream.push(msg),
+      end: () => stream.end(),
+      events: this.run(input, controller, stream),
+      abort: () => controller.abort(),
+    };
+  }
+
+  private async *run(
+    input: QueryInput,
+    controller: AbortController,
+    followups: MessageStream,
+  ): AsyncGenerator<ProviderEvent> {
+    if (providerName() !== 'openrouter') {
+      yield {
+        type: 'error',
+        message: `Unsupported OPENCODE_PROVIDER ${providerName()}; only openrouter available`,
+        retryable: false,
+      };
+      return;
+    }
+    const apiKey = providerAPIKey();
+    if (!apiKey) {
+      yield {
+        type: 'error',
+        message: 'OPENCODE_API_KEY or OPENROUTER_API_KEY not configured',
+        retryable: false,
+      };
+      return;
     }
 
-    const pending: string[] = [];
-    let waiting: (() => void) | null = null;
-    let ended = false;
-    let aborted = false;
+    const messages: ChatMessage[] = [];
+    if (input.systemContext?.instructions) {
+      messages.push({ role: 'system', content: input.systemContext.instructions });
+    }
+    messages.push({ role: 'user', content: input.prompt });
 
-    const systemInstructions = input.systemContext?.instructions;
-    pending.push(wrapPromptWithContext(input.prompt, systemInstructions));
+    yield { type: 'init', continuation: `opencode-${Date.now()}` };
 
-    const kick = (): void => {
-      waiting?.();
-    };
+    const primaryModel = normalizeOpenRouterModel(this.options.model);
+    const models = [primaryModel, ...fallbackModels().filter(m => m !== primaryModel)];
+    let usedModelIndex = 0;
 
-    const self = this;
-    const IDLE_TIMEOUT_MS = Number(process.env.OPENCODE_IDLE_TIMEOUT_MS) || 300_000;
+    while (true) {
+      yield { type: 'activity' };
 
-    async function* gen(): AsyncGenerator<ProviderEvent> {
-      let initYielded = false;
-      const rt = await ensureSharedRuntime(self.options);
-      const { client, stream } = rt;
+      // Drain follow-up messages pushed by poll-loop
+      for (const msg of followups.drain()) {
+        messages.push({ role: 'user', content: msg });
+        yield { type: 'activity' };
+      }
 
-      while (!aborted) {
-        while (pending.length === 0 && !ended && !aborted) {
-          await new Promise<void>((resolve) => {
-            waiting = resolve;
-          });
-          waiting = null;
+      let response: unknown;
+      let modelFound = false;
+
+      for (let i = usedModelIndex; i < models.length; i++) {
+        const model = models[i];
+        if (controller.signal.aborted) {
+          yield { type: 'error', message: 'Request aborted', retryable: false };
+          return;
         }
-
-        if (aborted) return;
-        if (pending.length === 0 && ended) return;
-
-        const text = pending.shift()!;
-        let sessionId = self.activeSessionId;
-
-        if (!sessionId) {
-          const created = await client.session.create();
-          if (created.error) {
-            throw new Error(`OpenCode: failed to create session: ${JSON.stringify(created.error)}`);
-          }
-          sessionId = created.data?.id;
-          if (!sessionId) throw new Error('OpenCode: failed to create session (no id)');
-          self.activeSessionId = sessionId;
-        }
-
-        if (!initYielded) {
-          yield { type: 'init', continuation: sessionId };
-          initYielded = true;
-        }
-
-        const promptRes = await client.session.promptAsync({
-          path: { id: sessionId },
-          body: { parts: [{ type: 'text', text }] },
-        });
-        if (promptRes.error) {
-          self.activeSessionId = undefined;
-          throw new Error(`OpenCode promptAsync: ${JSON.stringify(promptRes.error)}`);
-        }
-
-        const partTextByMessageId = new Map<string, string>();
-        const roleByMessageId = new Map<string, string>();
-        let lastEventAt = Date.now();
-        let eventTimedOut = false;
-        const timeoutCheck = setInterval(() => {
-          if (Date.now() - lastEventAt > IDLE_TIMEOUT_MS) {
-            log(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms) — clearing session ${sessionId}`);
-            eventTimedOut = true;
-            self.activeSessionId = undefined;
-            destroySharedRuntime();
-            kick();
-          }
-        }, 5000);
 
         try {
-          turn: while (true) {
-            if (aborted) return;
-            if (eventTimedOut) {
-              throw new Error(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms)`);
+          const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+            method: 'POST',
+            signal: controller.signal,
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              'Content-Type': 'application/json',
+              'HTTP-Referer': 'https://vulpineos.com',
+              'X-Title': 'VulpineOS',
+            },
+            body: JSON.stringify({
+              model,
+              messages,
+              tools: [BASH_TOOL, WEB_TOOL],
+              tool_choice: 'auto',
+              stream: true,
+            }),
+          });
+
+          yield { type: 'activity' };
+
+          if (!res.ok) {
+            const body = await res.text();
+            if (res.status === 429 && i < models.length - 1) {
+              continue;
             }
+            yield {
+              type: 'error',
+              message: `OpenRouter returned ${res.status}: ${body}`,
+              retryable: res.status >= 500 || res.status === 429,
+            };
+            return;
+          }
 
-            const { value: ev, done } = await stream.next();
-            if (done) {
-              throw new Error('OpenCode SSE stream ended unexpectedly');
+          const streamReader = res.body.getReader();
+          const streamDecoder = new TextDecoder();
+          let streamBuffer = '';
+          let streamContent = '';
+          let streamToolCalls: ChatMessage['tool_calls'] = [];
+          let streamToolCallAccum: Map<number, { id?: string; name?: string; args?: string }> = new Map();
+          const MAX_STREAM_FILE_SIZE = 256 * 1024;
+          let streamFileSize = 0;
+          const streamPath = process.env.STREAM_PATH || '/workspace/stream.jsonl';
+          let streamFd: number | null = null;
+          try { streamFd = fs.openSync(streamPath, 'w'); } catch (_) {}
+
+          process.on('exit', () => {
+            try { fs.unlinkSync(streamPath); } catch (_) {}
+          });
+
+          const streamByteLength = (s: string): number => {
+            return new TextEncoder().encode(s).length;
+          };
+          function streamWriteSync(data: string) {
+            if (streamFd === null) return;
+            const line = data + '\n';
+            if (streamFileSize + streamByteLength(line) > MAX_STREAM_FILE_SIZE) {
+              try { fs.ftruncateSync(streamFd, 0); fs.closeSync(streamFd); } catch (_) {}
+              streamFd = null;
+              return;
             }
+            try {
+              fs.writeSync(streamFd, line);
+              fs.fsyncSync(streamFd);
+              streamFileSize += streamByteLength(line);
+            } catch (_) {}
+          }
 
-            if (!ev?.type || ev.type === 'server.connected' || ev.type === 'server.heartbeat') continue;
-
-            lastEventAt = Date.now();
-            yield { type: 'activity' };
-
-            switch (ev.type) {
-              case 'message.updated': {
-                const info = ev.properties.info as { id?: string; role?: string } | undefined;
-                if (info?.id && info?.role) {
-                  roleByMessageId.set(info.id, info.role);
+          readLoop: while (true) {
+            const { done, value } = await streamReader.read();
+            if (done) break;
+            streamBuffer += streamDecoder.decode(value, { stream: true });
+            const lines = streamBuffer.split('\n');
+            streamBuffer = lines.pop() || '';
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed || !trimmed.startsWith('data: ')) continue;
+              const dataStr = trimmed.slice(6);
+              if (dataStr === '[DONE]') break readLoop;
+              try {
+                const parsed = JSON.parse(dataStr);
+                const choice = parsed.choices?.[0];
+                if (!choice) continue;
+                const delta = choice.delta || {};
+                if (delta.content) {
+                  streamContent += delta.content;
+                  streamWriteSync(JSON.stringify({ t: delta.content }));
                 }
-                break;
-              }
-              case 'message.part.updated': {
-                const part = ev.properties.part as { type?: string; messageID?: string; text?: string } | undefined;
-                if (part?.type === 'text' && part.messageID && part.text) {
-                  partTextByMessageId.set(part.messageID, part.text);
-                }
-                break;
-              }
-              case 'permission.updated': {
-                const perm = ev.properties as { id?: string; sessionID?: string };
-                if (perm.sessionID === sessionId && perm.id) {
-                  try {
-                    await client.postSessionIdPermissionsPermissionId({
-                      path: { id: sessionId, permissionID: perm.id },
-                      body: { response: 'always' },
-                    });
-                  } catch (err) {
-                    log(`Failed to auto-reply permission: ${err instanceof Error ? err.message : String(err)}`);
+                if (delta.tool_calls) {
+                  for (const tc of delta.tool_calls) {
+                    const idx = tc.index || 0;
+                    if (!streamToolCallAccum.has(idx)) streamToolCallAccum.set(idx, {});
+                    const acc = streamToolCallAccum.get(idx)!;
+                    if (tc.id) acc.id = tc.id;
+                    if (tc.function?.name) acc.name = tc.function.name;
+                    if (tc.function?.arguments) acc.args = (acc.args || '') + tc.function.arguments;
                   }
                 }
-                break;
-              }
-              case 'session.status': {
-                const props = ev.properties as {
-                  sessionID?: string;
-                  status?: { type?: string; attempt?: number; message?: string };
-                };
-                if (props.sessionID !== sessionId) break;
-                const st = props.status;
-                if (
-                  st?.type === 'retry' &&
-                  typeof st.attempt === 'number' &&
-                  st.attempt >= SESSION_STATUS_RETRY_ERROR_AFTER &&
-                  st.message
-                ) {
-                  self.activeSessionId = undefined;
-                  throw new Error(`OpenCode retry limit (${st.attempt}): ${st.message}`);
-                }
-                break;
-              }
-              case 'session.error': {
-                const props = ev.properties as { sessionID?: string; error?: unknown };
-                if (props.sessionID === sessionId || props.sessionID === undefined) {
-                  self.activeSessionId = undefined;
-                  throw new Error(sessionErrorMessage(props));
-                }
-                break;
-              }
-              case 'session.idle': {
-                const sid = (ev.properties as { sessionID?: string }).sessionID;
-                if (sid === sessionId) {
-                  break turn;
-                }
-                break;
-              }
-              default:
-                break;
+              } catch (_) {}
             }
           }
-        } finally {
-          clearInterval(timeoutCheck);
+
+          // Reconstruct tool_calls from accumulated SSE chunks
+          for (const [idx, acc] of streamToolCallAccum) {
+            if (acc.id && acc.name) {
+              streamToolCalls.push({
+                id: acc.id,
+                type: 'function',
+                function: { name: acc.name, arguments: acc.args || '{}' },
+              });
+            }
+          }
+
+          // Write done marker with full accumulated text
+          if (streamContent) {
+            streamWriteSync(JSON.stringify({ done: streamContent }));
+          }
+          if (streamFd !== null) { try { fs.closeSync(streamFd); } catch (_) {} }
+
+          // Build response object compatible with the rest of the tool-call loop
+          response = {
+            choices: [{
+              finish_reason: streamToolCalls.length > 0 ? 'tool_calls' : 'stop',
+              message: {
+                role: 'assistant' as const,
+                content: streamContent || null,
+                ...(streamToolCalls.length > 0 ? { tool_calls: streamToolCalls } : {}),
+              },
+            }],
+          } as unknown as { choices?: Array<{ finish_reason: string; message: ChatMessage & { tool_calls?: ChatMessage['tool_calls'] } }> };
+          usedModelIndex = i;
+          modelFound = true;
+          break;
+        } catch (err) {
+          if (err instanceof Error && (err.name === 'AbortError' || controller.signal.aborted)) {
+            yield { type: 'error', message: 'Request aborted', retryable: false };
+            return;
+          }
+          if (i < models.length - 1) continue;
+          yield {
+            type: 'error',
+            message: err instanceof Error ? err.message : String(err),
+            retryable: false,
+          };
+          return;
+        }
+      }
+
+      if (!modelFound) return;
+
+      const choices = (response as { choices?: Array<{ finish_reason: string; message: ChatMessage & { tool_calls?: ChatMessage['tool_calls'] } }> }).choices;
+      const choice = choices?.[0];
+      if (!choice) {
+        yield { type: 'error', message: 'Empty response from OpenRouter', retryable: false };
+        return;
+      }
+
+      const message = choice.message;
+
+      // Tool calls: execute each one, append results, loop
+      if (choice.finish_reason === 'tool_calls' && message.tool_calls?.length) {
+        messages.push({
+          role: 'assistant',
+          content: message.content || null,
+          tool_calls: message.tool_calls,
+        });
+
+        // Build tool info map for structured compression
+        const toolInfo = new Map<string, { name: string; url?: string; command?: string }>();
+        for (const tc of message.tool_calls) {
+          if (tc.type !== 'function') continue;
+          try {
+            const args = JSON.parse(tc.function.arguments) as Record<string, unknown>;
+            toolInfo.set(tc.id, {
+              name: tc.function.name,
+              url: typeof args.url === 'string' ? args.url : undefined,
+              command: typeof args.command === 'string' ? args.command : undefined,
+            });
+          } catch {}
         }
 
-        let resultText = '';
-        for (const [msgId, role] of roleByMessageId) {
-          if (role === 'assistant') {
-            resultText = partTextByMessageId.get(msgId) ?? resultText;
+        for (const tc of message.tool_calls) {
+          if (tc.type !== 'function') continue;
+
+          let result: string;
+          try {
+            const args = JSON.parse(tc.function.arguments) as Record<string, unknown>;
+            if (tc.function.name === 'bash') {
+              const command = String(args.command ?? '');
+              const timeout = typeof args.timeout === 'number' ? args.timeout : 30000;
+              result = execSync(command, {
+                cwd: '/workspace/agent',
+                timeout,
+                encoding: 'utf-8',
+                maxBuffer: 50 * 1024 * 1024,
+                signal: controller.signal,
+              });
+              if (result.length > 50000) {
+                result = result.slice(0, 50000) + `\n... [truncated ${result.length - 50000} more bytes]`;
+              }
+            } else if (tc.function.name === 'web') {
+              const url = String(args.url ?? '');
+              const viewportOnly = args.viewportOnly !== false;
+              const profile = String(args.profile || 'compact');
+              try {
+                const cdpUrl = process.env.AGENT_BROWSER_CDP || process.env.AGENT_BROWSER_CDP_URL;
+                const flags = [];
+                if (viewportOnly) flags.push('--viewport-only');
+                if (profile) flags.push('--profile ' + profile);
+                if (typeof args.maxNodes === 'number' && args.maxNodes > 0) flags.push('--max-nodes ' + args.maxNodes);
+                const flagStr = flags.length > 0 ? ' ' + flags.join(' ') : '';
+                const cmd = 'agent-browser connect ' + cdpUrl + ' && agent-browser open ' + JSON.stringify(url) + ' && agent-browser wait --load networkidle && agent-browser snapshot -i' + flagStr;
+                result = execSync(cmd, {
+                  cwd: '/workspace/agent',
+                  timeout: 60000,
+                  encoding: 'utf-8',
+                  maxBuffer: 50 * 1024 * 1024,
+                  signal: controller.signal,
+                });
+              } catch (_err) {
+                // Retry without flags if CLI rejected them
+                try {
+                  const cdpUrl = process.env.AGENT_BROWSER_CDP || process.env.AGENT_BROWSER_CDP_URL;
+                  const cmd = 'agent-browser connect ' + cdpUrl + ' && agent-browser open ' + JSON.stringify(url) + ' && agent-browser wait --load networkidle && agent-browser snapshot -i';
+                  result = execSync(cmd, {
+                    cwd: '/workspace/agent',
+                    timeout: 60000,
+                    encoding: 'utf-8',
+                    maxBuffer: 50 * 1024 * 1024,
+                    signal: controller.signal,
+                  });
+                } catch (_retryErr) {
+                  const errMsg = _retryErr instanceof Error ? _retryErr.message : String(_retryErr);
+                  result = 'agent-browser failed: ' + errMsg;
+                }
+              }
+              if (result.length > 50000) {
+                result = result.slice(0, 50000) + '\n... [truncated ' + (result.length - 50000) + ' more bytes]';
+              }
+            } else {
+              result = `Unknown tool: ${tc.function.name}`;
+            }
+          } catch (err) {
+            result = `Error: ${err instanceof Error ? err.message : String(err)}`;
+          }
+
+          messages.push({ role: 'tool', tool_call_id: tc.id, content: result });
+          yield { type: 'activity' };
+        }
+
+        // Compress older tool results -- keep last 2 full, use structured summaries for older ones
+        let recentToolResults = 0;
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].role === 'tool') {
+            recentToolResults++;
+            if (recentToolResults > 2 && messages[i].content.length > 2000) {
+              const info = toolInfo.get(messages[i].tool_call_id ?? '');
+              const tag = info?.name || 'tool';
+              const detail = info?.url || info?.command || '';
+              messages[i].content = `[${tag}] ${detail} -- returned ${messages[i].content.length} bytes -- full content already processed above`;
+            }
           }
         }
-        yield { type: 'result', text: resultText || null };
-      }
-    }
 
-    return {
-      push: (message: string) => {
-        pending.push(wrapPromptWithContext(message, systemInstructions));
-        kick();
-      },
-      end: () => {
-        ended = true;
-        kick();
-      },
-      events: gen(),
-      abort: () => {
-        aborted = true;
-        this.activeSessionId = undefined;
-        kick();
-        destroySharedRuntime();
-      },
-    };
+        continue;
+      }
+
+      // Text response
+      let text = message.content || '';
+      if (usedModelIndex > 0) {
+        text = `[Switched to ${models[usedModelIndex]}]\n\n${text}`;
+      }
+      yield { type: 'result', text };
+      return;
+    }
   }
 }
 
-registerProvider('opencode', (opts) => new OpenCodeProvider(opts));
+registerProvider('opencode', options => new OpenCodeProvider(options));
