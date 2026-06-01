@@ -224,6 +224,14 @@ class OpenCodeProvider implements AgentProvider {
             try { fs.unlinkSync(streamPath); } catch (_) {}
           });
 
+          function stripMessageTags(text: string): string {
+            return text
+              .replace(/<message\s+[^>]*>/g, '')
+              .replace(/<\/message>/g, '')
+              .replace(/<internal>[\s\S]*?<\/internal>/g, '')
+              .trim();
+          }
+
           const streamByteLength = (s: string): number => {
             return new TextEncoder().encode(s).length;
           };
@@ -260,7 +268,6 @@ class OpenCodeProvider implements AgentProvider {
                 const delta = choice.delta || {};
                 if (delta.content) {
                   streamContent += delta.content;
-                  streamWriteSync(JSON.stringify({ t: delta.content }));
                 }
                 if (delta.tool_calls) {
                   for (const tc of delta.tool_calls) {
@@ -289,7 +296,7 @@ class OpenCodeProvider implements AgentProvider {
 
           // Write done marker with full accumulated text
           if (streamContent) {
-            streamWriteSync(JSON.stringify({ done: streamContent }));
+            streamWriteSync(JSON.stringify({ done: stripMessageTags(streamContent) }));
           }
           if (streamFd !== null) { try { fs.closeSync(streamFd); } catch (_) {} }
 
@@ -363,16 +370,21 @@ class OpenCodeProvider implements AgentProvider {
             const args = JSON.parse(tc.function.arguments) as Record<string, unknown>;
             if (tc.function.name === 'bash') {
               const command = String(args.command ?? '');
-              const timeout = typeof args.timeout === 'number' ? args.timeout : 30000;
-              result = execSync(command, {
-                cwd: '/workspace/agent',
-                timeout,
-                encoding: 'utf-8',
-                maxBuffer: 50 * 1024 * 1024,
-                signal: controller.signal,
-              });
-              if (result.length > 50000) {
-                result = result.slice(0, 50000) + `\n... [truncated ${result.length - 50000} more bytes]`;
+              const FORBIDDEN = /\b(playwright|puppeteer|selenium)\b/i;
+              if (FORBIDDEN.test(command)) {
+                result = 'Error: This command contains a reference to a forbidden browser automation tool (Playwright, Puppeteer, or Selenium). These tools are NOT available in this container. Use agent-browser for all browser interaction.';
+              } else {
+                const timeout = typeof args.timeout === 'number' ? args.timeout : 30000;
+                result = execSync(command, {
+                  cwd: '/workspace/agent',
+                  timeout,
+                  encoding: 'utf-8',
+                  maxBuffer: 50 * 1024 * 1024,
+                  signal: controller.signal,
+                });
+                if (result.length > 50000) {
+                  result = result.slice(0, 50000) + `\n... [truncated ${result.length - 50000} more bytes]`;
+                }
               }
             } else if (tc.function.name === 'web') {
               const url = String(args.url ?? '');

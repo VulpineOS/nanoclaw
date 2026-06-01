@@ -57,6 +57,14 @@ function providerToken(): string | undefined {
   return process.env.OPENAI_ACCESS_TOKEN;
 }
 
+function stripMessageTags(text: string): string {
+  return text
+    .replace(/<message\s+[^>]*>/g, '')
+    .replace(/<\/message>/g, '')
+    .replace(/<internal>[\s\S]*?<\/internal>/g, '')
+    .trim();
+}
+
 function normalizeCodexModel(model: string | undefined): string {
   const raw = (model || process.env.OPENCODE_MODEL || '').replace(/^openai\//, '');
   // Codex API uses model names like gpt-5.5, gpt-5.4 — no -codex suffix.
@@ -306,7 +314,6 @@ class CodexProvider implements AgentProvider {
               if (type === 'response.output_text.delta') {
                 const delta = parsed.delta as string || '';
                 content += delta;
-                streamWriteSync(JSON.stringify({ t: delta }));
                 yield { type: 'activity' };
               } else if (type === 'response.function_call_arguments.delta') {
                 const delta = parsed.delta as string || '';
@@ -336,13 +343,19 @@ class CodexProvider implements AgentProvider {
 
         // Write done marker after SSE stream ends
         if (content) {
-          streamWriteSync(JSON.stringify({ done: content }));
+          streamWriteSync(JSON.stringify({ done: stripMessageTags(content) }));
         }
         if (streamFd !== null) { try { fs.closeSync(streamFd); } catch (_) {} }
 
         // Process results
         if (hasToolCall && toolName) {
-          conversation.push({ role: 'assistant', content: content || '' });
+          // In the Responses API, function_call items inherently represent the
+          // assistant's response — no separate empty assistant message needed.
+          // Pushing one would tell the model "assistant already replied," shifting
+          // every subsequent response by one turn (the one-behind bug).
+          if (content) {
+            conversation.push({ role: 'assistant', content });
+          }
 
           const tcCallId = toolCallId || `call_${Date.now()}`;
           conversation.push({ role: 'function_call', call_id: tcCallId, name: toolName, arguments: toolArgs });

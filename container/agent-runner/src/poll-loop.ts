@@ -558,7 +558,7 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
 
 function isVulpineReplyAlias(name: string): boolean {
   const normalized = name.trim().toLowerCase();
-  return normalized === 'vulpine' || normalized === 'vulpineos' || normalized === 'user' || normalized === 'operator';
+  return normalized === 'vulpine' || normalized === 'vulpineos' || normalized === 'user' || normalized === 'operator' || normalized.startsWith('vulpine-');
 }
 
 function sendToCurrentRouting(body: string, routing: RoutingContext): boolean {
